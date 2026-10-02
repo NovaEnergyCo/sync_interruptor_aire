@@ -1,0 +1,209 @@
+blueprint:
+  name: Sincronizar interruptor con aire (contacto seco o termostato)
+  description: >
+    Mantiene sincronizados un interruptor y un equipo de aire acondicionado,
+    que puede ser un contacto seco (switch que acciona un contactor) o un
+    termostato (climate).
+
+
+    **Interruptor → Equipo**
+
+    - Interruptor ON: enciende el contacto seco, o pone el termostato en modo
+      COOL a la temperatura configurada.
+
+    - Interruptor OFF: apaga el contacto seco o el termostato.
+
+
+    **Equipo → Interruptor**
+
+    - Contacto seco ON / termostato en cualquier modo distinto de OFF:
+      enciende el interruptor.
+
+    - Contacto seco OFF / termostato OFF: apaga el interruptor.
+
+
+    Los cambios desde/hacia "unavailable" o "unknown" se ignoran, para que un
+    reinicio de Home Assistant o una reconexión del controlador no dispare
+    acciones.
+  domain: automation
+  homeassistant:
+    min_version: 2024.10.0
+  input:
+    interruptor:
+      name: Interruptor
+      description: Interruptor que manda sobre el aire (switch, input_boolean o light).
+      selector:
+        entity:
+          filter:
+            - domain:
+                - switch
+                - input_boolean
+                - light
+    equipo:
+      name: Contacto seco o termostato
+      description: >
+        Si es un switch se trata como contacto seco. Si es un climate se trata
+        como termostato.
+      selector:
+        entity:
+          filter:
+            - domain:
+                - switch
+                - climate
+    temperatura:
+      name: Temperatura deseada (solo termostato)
+      description: Temperatura que se fija al encender el termostato en modo COOL.
+      default: 24
+      selector:
+        number:
+          min: 16
+          max: 30
+          step: 0.5
+          unit_of_measurement: "°C"
+          mode: slider
+    estabilizacion:
+      name: Tiempo de estabilización del equipo
+      description: >
+        Segundos que el estado del equipo debe mantenerse antes de reflejarlo
+        en el interruptor. Filtra rebotes de estado de termostatos Z-Wave/IR.
+      default: 2
+      selector:
+        number:
+          min: 0
+          max: 30
+          step: 1
+          unit_of_measurement: s
+          mode: box
+    ventana_eco:
+      name: Ventana anti-eco
+      description: >
+        Si el interruptor cambió hace menos de estos segundos, se ignoran los
+        cambios del equipo. Evita que un equipo lento en confirmar el comando
+        devuelva un estado viejo y apague/encienda el interruptor. 0 = desactivado.
+      default: 10
+      selector:
+        number:
+          min: 0
+          max: 60
+          step: 1
+          unit_of_measurement: s
+          mode: box
+
+mode: queued
+max: 10
+max_exceeded: silent
+
+triggers:
+  - trigger: state
+    entity_id: !input interruptor
+    to: null # solo cambios de estado, no de atributos
+    id: interruptor
+  - trigger: state
+    entity_id: !input equipo
+    to: null
+    for:
+      seconds: !input estabilizacion
+    id: equipo
+
+variables:
+  interruptor: !input interruptor
+  equipo: !input equipo
+  temperatura: !input temperatura
+  ventana_eco: !input ventana_eco
+  invalidos: ["unavailable", "unknown"]
+  es_termostato: "{{ equipo.split('.')[0] == 'climate' }}"
+  equipo_disponible: "{{ states(equipo) not in invalidos }}"
+  equipo_encendido: "{{ states(equipo) not in ['off'] + invalidos }}"
+  interruptor_disponible: "{{ states(interruptor) not in invalidos }}"
+  interruptor_encendido: "{{ is_state(interruptor, 'on') }}"
+  segundos_desde_interruptor: >
+    {{ (now() - states[interruptor].last_changed).total_seconds()
+       if states[interruptor] is not none else 9999 }}
+
+conditions:
+  - condition: template
+    value_template: >
+      {{ trigger.from_state is not none and trigger.to_state is not none
+         and trigger.from_state.state not in invalidos
+         and trigger.to_state.state not in invalidos }}
+
+actions:
+  - choose:
+      # ---------- Interruptor ON -> encender equipo ----------
+      - conditions:
+          - condition: template
+            value_template: >
+              {{ trigger.id == 'interruptor'
+                 and trigger.to_state.state == 'on'
+                 and equipo_disponible and not equipo_encendido }}
+        sequence:
+          - if:
+              - condition: template
+                value_template: "{{ es_termostato }}"
+            then:
+              - action: climate.set_hvac_mode
+                target:
+                  entity_id: !input equipo
+                data:
+                  hvac_mode: cool
+              - delay:
+                  seconds: 1
+              - action: climate.set_temperature
+                target:
+                  entity_id: !input equipo
+                data:
+                  temperature: "{{ temperatura }}"
+            else:
+              - action: switch.turn_on
+                target:
+                  entity_id: !input equipo
+
+      # ---------- Interruptor OFF -> apagar equipo ----------
+      - conditions:
+          - condition: template
+            value_template: >
+              {{ trigger.id == 'interruptor'
+                 and trigger.to_state.state == 'off'
+                 and equipo_disponible and equipo_encendido }}
+        sequence:
+          - if:
+              - condition: template
+                value_template: "{{ es_termostato }}"
+            then:
+              - action: climate.set_hvac_mode
+                target:
+                  entity_id: !input equipo
+                data:
+                  hvac_mode: "off"
+            else:
+              - action: switch.turn_off
+                target:
+                  entity_id: !input equipo
+
+      # ---------- Equipo encendido -> encender interruptor ----------
+      - conditions:
+          - condition: template
+            value_template: >
+              {{ trigger.id == 'equipo'
+                 and trigger.to_state.state != 'off'
+                 and equipo_encendido
+                 and interruptor_disponible and not interruptor_encendido
+                 and segundos_desde_interruptor > ventana_eco }}
+        sequence:
+          - action: homeassistant.turn_on
+            target:
+              entity_id: !input interruptor
+
+      # ---------- Equipo apagado -> apagar interruptor ----------
+      - conditions:
+          - condition: template
+            value_template: >
+              {{ trigger.id == 'equipo'
+                 and trigger.to_state.state == 'off'
+                 and not equipo_encendido
+                 and interruptor_disponible and interruptor_encendido
+                 and segundos_desde_interruptor > ventana_eco }}
+        sequence:
+          - action: homeassistant.turn_off
+            target:
+              entity_id: !input interruptor
